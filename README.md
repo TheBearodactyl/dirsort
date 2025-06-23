@@ -23,7 +23,7 @@ This document contains the help content for the `dirsort` command-line program.
 - `--blacklist-file <BLACKLIST_FILE>` — Path to file containing blacklisted extensions (one per line)
 - `-j`, `--threads <THREADS>` — Number of threads to use for parallel processing (default: number of CPU cores)
 - `-d`, `--max-depth <MAX_DEPTH>` — Maximum depth to recurse into directories (0 = current directory only, default: unlimited)
-- `-c`, `--config <CONFIG>`
+- `-c`, `--config <CONFIG>` — Path to a configuration file with desired categories ([**default**](#default-configuration))
 
 <hr/>
 
