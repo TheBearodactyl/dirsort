@@ -6,9 +6,9 @@ This document contains the help content for the `dirsort` command-line program.
 
 <!--toc:start-->
 - [Command-Line Help for `dirsort`](#command-line-help-for-dirsort)
-  - [`dirsort`](#dirsort)
+  * [`dirsort`](#dirsort)
           - [**Options:**](#options)
-  - [Default configuration:](#default-configuration)
+  * [Default configuration:](#default-configuration)
 <!--toc:end-->
 
 ## `dirsort`
