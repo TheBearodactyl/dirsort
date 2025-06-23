@@ -1,17 +1,32 @@
-use std::{
-    collections::HashSet,
-    fs::{self, *},
-    io::*,
-    path::Path,
-    process,
-    sync::{Arc, Mutex},
+use {
+    clap::Parser,
+    clap_markdown::help_markdown,
+    indicatif::ProgressBar,
+    notify_rust::{Notification, Timeout},
+    prettylogger::Logger,
+    rayon::iter::{IntoParallelRefIterator, ParallelIterator},
+    serde::{Deserialize, Serialize},
+    std::{
+        collections::{HashMap, HashSet},
+        fs::{self, *},
+        io::*,
+        path::Path,
+        process,
+        sync::{Arc, LazyLock, Mutex},
+    },
+    walkdir::WalkDir,
 };
 
-use clap::Parser;
-use indicatif::ProgressBar;
-use notify_rust::{Notification, Timeout};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use walkdir::WalkDir;
+const DEFAULT_CATEGORY_CONFIG: &str = r#"
+[categories]
+Images = ["gif", "ico", "jpeg", "jpg", "jpg~", "png", "png~", "webp"]
+Videos = ["mp4", "mkv", "ogv", "webm"]
+Documents = ["pdf", "docx", "doc", "txt", "md"]
+Audio = ["mp3", "wav", "flac", "ogg"]
+Archives = ["zip", "tar", "gz", "rar"]
+"#;
+
+static LOGGER_INTERFACE: LazyLock<Logger> = LazyLock::new(|| Logger::default());
 
 #[derive(clap::Parser)]
 struct Cli {
@@ -43,31 +58,86 @@ struct Cli {
     #[arg(short = 'd', long = "max-depth")]
     max_depth: Option<usize>,
 
+    #[arg(short = 'c', long = "config")]
+    config: Option<String>,
+
     #[arg(short, long, hide = true)]
     gen_docs: bool,
 }
 
-fn move_file<P: AsRef<Path>>(from: P, to: P) -> std::io::Result<()> {
+#[derive(Serialize, Deserialize)]
+struct SorterConfig {
+    categories: HashMap<String, Vec<String>>,
+}
+
+fn move_file<P: AsRef<Path>>(from: P, to: P) -> Result<()> {
     let from_path = from.as_ref();
     let to_path = to.as_ref();
 
     if !from_path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+        return Err(Error::new(
+            ErrorKind::NotFound,
             "[ERROR]: Source file does not exist",
         ));
     }
 
     if let Some(parent) = to_path.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_all(parent)?;
     }
 
-    fs::rename(from_path, to_path)?;
+    rename(from_path, to_path)?;
 
     Ok(())
 }
 
-fn copy_file(source: &str, dest: &str, clean: bool) -> std::io::Result<()> {
+fn load_categories(
+    path: &Option<String>,
+) -> std::result::Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
+    let content = if let Some(path_str) = path {
+        match fs::read_to_string(path_str) {
+            Ok(contents) => contents,
+            Err(e) => {
+                LOGGER_INTERFACE.warning(
+                    format!(
+                        "Failed to read config file '{}': {}\nFalling back to default.",
+                        path_str, e
+                    )
+                    .as_str(),
+                );
+                DEFAULT_CATEGORY_CONFIG.to_string()
+            }
+        }
+    } else {
+        DEFAULT_CATEGORY_CONFIG.to_string()
+    };
+
+    let config: SorterConfig = toml::from_str(&content)?;
+    let normalized = config
+        .categories
+        .into_iter()
+        .map(|(k, v)| {
+            let cleaned_exts = v
+                .into_iter()
+                .map(|ext| ext.trim_start_matches('.').to_lowercase())
+                .collect();
+            (k, cleaned_exts)
+        })
+        .collect();
+
+    Ok(normalized)
+}
+
+fn get_category<'a>(ext: &str, categories: &'a HashMap<String, Vec<String>>) -> Option<&'a str> {
+    for (cat, exts) in categories {
+        if exts.contains(&ext.to_lowercase()) {
+            return Some(cat);
+        }
+    }
+
+    None
+}
+
+fn copy_file(source: &str, dest: &str, clean: bool) -> Result<()> {
     let src = Path::new(source);
     let destination = Path::new(dest);
 
@@ -90,14 +160,14 @@ fn send_finished_notif(operation: &str) {
     if let Err(e) = Notification::new()
         .summary(&format!("Finished {}", operation))
         .body(&format!(
-            "`parmove` has finished {} the directory",
+            "`dirsort` has finished {} the directory",
             operation
         ))
         .icon("vivaldi")
         .timeout(Timeout::Milliseconds(1000))
         .show()
     {
-        eprintln!("Warning: Failed to display notification: {}", e);
+        LOGGER_INTERFACE.warning(format!("Failed to display notification: {}", e).as_str());
     }
 }
 
@@ -121,7 +191,7 @@ fn load_blacklist(argv: &Cli) -> std::result::Result<HashSet<String>, Box<dyn st
     }
 
     if let Some(ref file_path) = argv.blacklist_file {
-        let content = std::fs::read_to_string(file_path)
+        let content = fs::read_to_string(file_path)
             .map_err(|e| format!("Failed to read blacklist file '{}': {}", file_path, e))?;
 
         for line in content.lines() {
@@ -166,14 +236,12 @@ fn setup_thread_pool(
                 .num_threads(count)
                 .build_global()
                 .map_err(|e| format!("Failed to configure thread pool: {}", e))?;
-            println!("Using {} threads for parallel processing", count);
+
+            LOGGER_INTERFACE.info(format!("Using {} threads", count).as_str());
         }
         None => {
             let default_threads = rayon::current_num_threads();
-            println!(
-                "Using {} threads for parallel processing (default)",
-                default_threads
-            );
+            LOGGER_INTERFACE.info(format!("Using {} threads", default_threads).as_str());
         }
     }
     Ok(())
@@ -187,12 +255,14 @@ fn collect_files(
     if let Some(depth) = max_depth {
         walker = walker.max_depth(depth);
         match depth {
-            0 => println!("Collecting files from current directory only"),
-            1 => println!("Collecting files from current directory and immediate subdirectories"),
-            _ => println!("Collecting files with maximum depth of {} levels", depth),
+            0 => LOGGER_INTERFACE.info("Collecting files from current directory only"),
+            1 => LOGGER_INTERFACE
+                .info("Collecting files from current directory and immediate subdirectories"),
+            _ => LOGGER_INTERFACE
+                .info(format!("Collecting files with maximum depth of {} levels", depth).as_str()),
         }
     } else {
-        println!("Collecting files from all subdirectories (unlimited depth)");
+        LOGGER_INTERFACE.info("Collecting files from all subdirectories (unlimited depth)");
     }
 
     let mut entries = Vec::new();
@@ -202,7 +272,7 @@ fn collect_files(
         let item = match entry {
             Ok(item) => item,
             Err(e) => {
-                eprintln!("Warning: Failed to read directory entry: {}", e);
+                LOGGER_INTERFACE.error(format!("Failed to read directory entry: {}", e).as_str());
                 continue;
             }
         };
@@ -214,10 +284,13 @@ fn collect_files(
         }
     }
 
-    println!(
-        "Scanned {} directories, found {} files",
-        directories_scanned,
-        entries.len()
+    LOGGER_INTERFACE.info(
+        format!(
+            "Scanned {} directories, found {} files",
+            directories_scanned,
+            entries.len()
+        )
+        .as_str(),
     );
     Ok(entries)
 }
@@ -227,6 +300,7 @@ fn process_file(
     out_dir: &str,
     use_move: bool,
     blacklist: &HashSet<String>,
+    categories: &HashMap<String, Vec<String>>,
     errors: &Arc<Mutex<Vec<String>>>,
     skipped: &Arc<Mutex<u64>>,
 ) {
@@ -246,8 +320,10 @@ fn process_file(
         let source_path = entry.path().display().to_string();
 
         let (target_dir, dest_path) = if let Some(ext) = entry.path().extension() {
-            let ext = ext.to_str().ok_or("Invalid extension encoding")?;
-            let target_dir = Path::new(out_dir).join(ext);
+            let ext_str = ext.to_str().ok_or("Invalid extension encoding")?;
+            let category = get_category(ext_str, categories);
+            let subfolder = category.unwrap_or(ext_str);
+            let target_dir = Path::new(out_dir).join(subfolder);
             let dest_path = target_dir.join(file_name);
             (target_dir, dest_path)
         } else {
@@ -282,44 +358,47 @@ fn main() {
     let args = Cli::parse();
 
     if args.gen_docs {
-        println!("{}", clap_markdown::help_markdown::<Cli>());
-        std::process::exit(1);
+        println!("{}", help_markdown::<Cli>());
+        process::exit(1);
     }
 
     if let Err(e) = setup_thread_pool(args.threads) {
-        eprintln!("Error configuring threads: {}", e);
+        LOGGER_INTERFACE.error(format!("Error configuring threads: {}", e).as_str());
         process::exit(1);
     }
 
     let blacklist = match load_blacklist(&args) {
         Ok(blacklist) => blacklist,
         Err(e) => {
-            eprintln!("Error loading blacklist: {}", e);
+            LOGGER_INTERFACE.error(format!("Error loading blacklist: {}", e).as_str());
             process::exit(1);
         }
     };
 
     if !blacklist.is_empty() {
-        println!(
-            "Blacklisted extensions: {}",
-            blacklist
-                .iter()
-                .map(|s| format!(".{}", s))
-                .collect::<Vec<_>>()
-                .join(", ")
+        LOGGER_INTERFACE.info(
+            format!(
+                "Blacklisted extensions: {}",
+                blacklist
+                    .iter()
+                    .map(|s| format!(".{}", s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .as_str(),
         );
     }
 
     let entries = match collect_files(args.max_depth) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!("Error collecting files: {}", e);
+            LOGGER_INTERFACE.error(format!("Error collecting files: {}", e).as_str());
             process::exit(1);
         }
     };
 
     if entries.is_empty() {
-        println!("No files found to process.");
+        LOGGER_INTERFACE.warning("No files found to process.");
         return;
     }
 
@@ -329,23 +408,47 @@ fn main() {
     let skipped = Arc::new(Mutex::new(0u64));
 
     if let Err(e) = create_dir_all(&out_dir) {
-        eprintln!(
-            "Error: Failed to create output directory '{}': {}",
-            out_dir, e
-        );
+        LOGGER_INTERFACE
+            .error(format!("Failed to create output directory '{}': {}", out_dir, e).as_str());
         process::exit(1);
     }
 
     let operation = if args.mv { "moving" } else { "copying" };
-    println!(
-        "Starting {} {} files to '{}'...",
-        operation,
-        entries.len(),
-        out_dir
+    LOGGER_INTERFACE.info(
+        format!(
+            "Starting {} {} files to '{}'...",
+            operation,
+            entries.len(),
+            out_dir
+        )
+        .as_str(),
     );
 
+    let category_map = match load_categories(&args.config) {
+        Ok(map) => map,
+        Err(e) => {
+            LOGGER_INTERFACE.error(format!("Error loading categories: {}", e).as_str());
+            process::exit(1);
+        }
+    };
+
+    if !category_map.is_empty() {
+        LOGGER_INTERFACE.info("Loaded categories:");
+        for (cat, exts) in &category_map {
+            LOGGER_INTERFACE.info(format!("  {}: {:?}", cat, exts).as_str());
+        }
+    }
+
     entries.par_iter().for_each(|entry| {
-        process_file(entry, &out_dir, args.mv, &blacklist, &errors, &skipped);
+        process_file(
+            entry,
+            &out_dir,
+            args.mv,
+            &blacklist,
+            &category_map,
+            &errors,
+            &skipped,
+        );
         progress.inc(1);
     });
 
@@ -354,7 +457,7 @@ fn main() {
     let skipped_count = match skipped.lock() {
         Ok(count) => *count,
         Err(_) => {
-            eprintln!("Warning: Failed to get skipped file count");
+            LOGGER_INTERFACE.warning("Failed to get skipped file count");
             0
         }
     };
@@ -362,20 +465,22 @@ fn main() {
 
     if let Ok(errors_vec) = errors.lock() {
         if !errors_vec.is_empty() {
-            eprintln!("\nErrors encountered during processing:");
+            LOGGER_INTERFACE.error("\nErrors encountered during processing:");
             for error in errors_vec.iter() {
-                eprintln!("  {}", error);
+                LOGGER_INTERFACE.error(format!("  {}", error).as_str());
             }
-            eprintln!("\nProcessing completed with {} errors.", errors_vec.len());
+            LOGGER_INTERFACE
+                .info(format!("\nProcessing completed with {} errors.", errors_vec.len()).as_str());
         }
     }
 
-    println!("\nSummary:");
-    println!("  Files processed: {}", processed_count);
+    LOGGER_INTERFACE.info("\nSummary:");
+    LOGGER_INTERFACE.info(format!("  Files processed: {}", processed_count).as_str());
     if skipped_count > 0 {
-        println!("  Files skipped (blacklisted): {}", skipped_count);
+        LOGGER_INTERFACE.info(format!("  Files skipped (blacklisted): {}", skipped_count).as_str());
     }
-    println!("  Total files found: {}", entries.len());
+
+    LOGGER_INTERFACE.info(format!("  Total files found: {}", entries.len()).as_str());
 
     if args.notify {
         let operation = if args.mv { "moving" } else { "sorting" };

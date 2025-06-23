@@ -7,6 +7,9 @@ edition = "2024"
 clap = { version = "4.5.40", features = ["derive"] }
 clap-markdown = "0.1.5"
 indicatif = { version = "0.17.11", features = ["rayon"] }
+libprettylogger = "3.0.2"
 notify-rust = "4.11.7"
 rayon = "1.10.0"
+serde = { version = "1.0.219", features = ["derive"] }
+toml = "0.8.23"
 walkdir = "2.5.0"
