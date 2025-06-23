@@ -26,7 +26,7 @@ Audio = ["mp3", "wav", "flac", "ogg"]
 Archives = ["zip", "tar", "gz", "rar"]
 "#;
 
-static LOGGER_INTERFACE: LazyLock<Logger> = LazyLock::new(|| Logger::default());
+static LOGGER_INTERFACE: LazyLock<Logger> = LazyLock::new(Logger::default);
 
 #[derive(clap::Parser)]
 struct Cli {
@@ -58,6 +58,7 @@ struct Cli {
     #[arg(short = 'd', long = "max-depth")]
     max_depth: Option<usize>,
 
+    /// Path to a config file containing extension categories
     #[arg(short = 'c', long = "config")]
     config: Option<String>,
 
