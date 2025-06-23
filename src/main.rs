@@ -42,6 +42,9 @@ struct Cli {
     /// Maximum depth to recurse into directories (0 = current directory only, default: unlimited)
     #[arg(short = 'd', long = "max-depth")]
     max_depth: Option<usize>,
+
+    #[arg(short, long, hide = true)]
+    gen_docs: bool,
 }
 
 fn move_file<P: AsRef<Path>>(from: P, to: P) -> std::io::Result<()> {
@@ -181,7 +184,6 @@ fn collect_files(
 ) -> std::result::Result<Vec<walkdir::DirEntry>, Box<dyn std::error::Error>> {
     let mut walker = WalkDir::new(".");
 
-    // Configure depth limit
     if let Some(depth) = max_depth {
         walker = walker.max_depth(depth);
         match depth {
@@ -228,7 +230,6 @@ fn process_file(
     errors: &Arc<Mutex<Vec<String>>>,
     skipped: &Arc<Mutex<u64>>,
 ) {
-    // Check if file is blacklisted
     if is_blacklisted(entry.path(), blacklist) {
         if let Ok(mut skipped_count) = skipped.lock() {
             *skipped_count += 1;
@@ -280,6 +281,11 @@ fn process_file(
 fn main() {
     let args = Cli::parse();
 
+    if args.gen_docs {
+        println!("{}", clap_markdown::help_markdown::<Cli>());
+        std::process::exit(1);
+    }
+
     if let Err(e) = setup_thread_pool(args.threads) {
         eprintln!("Error configuring threads: {}", e);
         process::exit(1);
@@ -322,7 +328,6 @@ fn main() {
     let errors = Arc::new(Mutex::new(Vec::new()));
     let skipped = Arc::new(Mutex::new(0u64));
 
-    // Create output directory
     if let Err(e) = create_dir_all(&out_dir) {
         eprintln!(
             "Error: Failed to create output directory '{}': {}",
