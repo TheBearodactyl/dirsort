@@ -1,3 +1,6 @@
+#![warn(clippy::pedantic, clippy::nursery)]
+#![allow(clippy::struct_excessive_bools)]
+
 use {
     clap::Parser,
     clap_markdown::help_markdown,
@@ -8,11 +11,16 @@ use {
     serde::{Deserialize, Serialize},
     std::{
         collections::{HashMap, HashSet},
-        fs::{self, *},
-        io::*,
-        path::Path,
+        fs::{self, File, create_dir_all, remove_file, rename},
+        io::{Result, Write},
+        path::{Path, PathBuf},
         process,
-        sync::{Arc, LazyLock, Mutex},
+        error::{self, Error},
+        hash::RandomState,
+        sync::{
+            Arc, LazyLock, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
     },
     walkdir::WalkDir,
 };
@@ -62,6 +70,10 @@ struct Cli {
     #[arg(short = 'c', long = "config")]
     config: Option<String>,
 
+    /// Generate an HTML index file after sorting
+    #[arg(short = 'i', long = "index")]
+    gen_html: bool,
+
     #[arg(short, long, hide = true)]
     gen_docs: bool,
 }
@@ -71,46 +83,92 @@ struct SorterConfig {
     categories: HashMap<String, Vec<String>>,
 }
 
-fn move_file<P: AsRef<Path>>(from: P, to: P) -> Result<()> {
-    let from_path = from.as_ref();
-    let to_path = to.as_ref();
+fn move_file(from: &Path, to: &Path) -> Result<()> {
+    rename(from, to)
+}
 
-    if !from_path.exists() {
-        return Err(Error::new(
-            ErrorKind::NotFound,
-            "[ERROR]: Source file does not exist",
-        ));
+fn gen_html_index(output_dir: &Path) -> Result<()> {
+    let index_path = output_dir.join("index.html");
+    let mut file = File::create(&index_path)?;
+
+    let html = format!(
+        "<!DOCTYPE html>
+<html>
+<head>
+    <title>Directory Index</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        h1 {{ color: #333; }}
+        ul {{ list-style-type: none; padding: 0; }}
+        li {{ margin: 5px 0; }}
+        a {{ color: #0066cc; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+        .dir {{ font-weight: bold; color: #009933; }}
+    </style>
+</head>
+<body>
+    <h1>Directory Index: {}</h1>
+    <ul>
+",
+        output_dir.display(),
+    );
+
+    file.write_all(html.as_bytes())?;
+
+    for entry in WalkDir::new(output_dir)
+        .min_depth(1)
+        .sort_by(|a, b| a.file_name().cmp(b.file_name()))
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let relative_path = path.strip_prefix(output_dir).expect("AAAAAAA");
+
+        if path.is_dir() {
+            writeln!(
+                file,
+                r#"        <li><span class="dir">📁 {}/</span></li>"#,
+                relative_path.display()
+            )?;
+        } else {
+            let abs_path = path.canonicalize()?;
+            writeln!(
+                file,
+                r#"        <li><a href="file://{}" target="_blank">📄  {}</a></li>"#,
+                abs_path.display(),
+                relative_path.display()
+            )?;
+        }
     }
 
-    if let Some(parent) = to_path.parent() {
-        create_dir_all(parent)?;
-    }
+    writeln!(
+        file,
+        "    </ul>
+</body>
+</html>"
+    )?;
 
-    rename(from_path, to_path)?;
+    LOGGER_INTERFACE.info(format!("Generated HTML index at {}", index_path.display()).as_str());
 
     Ok(())
 }
 
 fn load_categories(
-    path: &Option<String>,
-) -> std::result::Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
-    let content = if let Some(path_str) = path {
-        match fs::read_to_string(path_str) {
-            Ok(contents) => contents,
-            Err(e) => {
+    path: Option<&String>,
+) -> std::result::Result<HashMap<String, Vec<String>>, Box<dyn error::Error>> {
+    let content = path.map_or_else(
+        || DEFAULT_CATEGORY_CONFIG.to_string(),
+        |path_str| {
+            fs::read_to_string(path_str).unwrap_or_else(|e| {
                 LOGGER_INTERFACE.warning(
                     format!(
-                        "Failed to read config file '{}': {}\nFalling back to default.",
-                        path_str, e
+                        "Failed to read config file '{path_str}': {e}\nFalling back to default."
                     )
                     .as_str(),
                 );
                 DEFAULT_CATEGORY_CONFIG.to_string()
-            }
-        }
-    } else {
-        DEFAULT_CATEGORY_CONFIG.to_string()
-    };
+            })
+        },
+    );
 
     let config: SorterConfig = toml::from_str(&content)?;
     let normalized = config
@@ -138,41 +196,29 @@ fn get_category<'a>(ext: &str, categories: &'a HashMap<String, Vec<String>>) -> 
     None
 }
 
-fn copy_file(source: &str, dest: &str, clean: bool) -> Result<()> {
-    let src = Path::new(source);
-    let destination = Path::new(dest);
-
-    if clean && destination.exists() {
-        remove_file(destination)?;
+fn copy_file(source: &str, dest: &str) -> Result<()> {
+    if Path::new(dest).exists() {
+        remove_file(dest)?;
     }
 
-    let mut reader = File::open(src)?;
-    let mut buffer = Vec::new();
-
-    reader.read_to_end(&mut buffer)?;
-    let mut writer = File::create(destination)?;
-
-    writer.write_all(&buffer)?;
+    fs::copy(source, dest)?;
 
     Ok(())
 }
 
 fn send_finished_notif(operation: &str) {
     if let Err(e) = Notification::new()
-        .summary(&format!("Finished {}", operation))
-        .body(&format!(
-            "`dirsort` has finished {} the directory",
-            operation
-        ))
+        .summary(&format!("Finished {operation}"))
+        .body(&format!("`dirsort` has finished {operation} the directory"))
         .icon("vivaldi")
         .timeout(Timeout::Milliseconds(1000))
         .show()
     {
-        LOGGER_INTERFACE.warning(format!("Failed to display notification: {}", e).as_str());
+        LOGGER_INTERFACE.warning(format!("Failed to display notification: {e}").as_str());
     }
 }
 
-fn load_blacklist(argv: &Cli) -> std::result::Result<HashSet<String>, Box<dyn std::error::Error>> {
+fn load_blacklist(argv: &Cli) -> std::result::Result<HashSet<String>, Box<dyn error::Error>> {
     let mut blacklist = HashSet::new();
 
     if let Some(ref blacklist_str) = argv.blacklist {
@@ -193,7 +239,7 @@ fn load_blacklist(argv: &Cli) -> std::result::Result<HashSet<String>, Box<dyn st
 
     if let Some(ref file_path) = argv.blacklist_file {
         let content = fs::read_to_string(file_path)
-            .map_err(|e| format!("Failed to read blacklist file '{}': {}", file_path, e))?;
+            .map_err(|e| format!("Failed to read blacklist file '{file_path}': {e}"))?;
 
         for line in content.lines() {
             let ext = line.trim().to_lowercase();
@@ -213,106 +259,78 @@ fn load_blacklist(argv: &Cli) -> std::result::Result<HashSet<String>, Box<dyn st
 }
 
 fn is_blacklisted(file_path: &Path, blacklist: &HashSet<String>) -> bool {
-    if blacklist.is_empty() {
-        return false;
-    }
-
-    if let Some(extension) = file_path.extension() {
-        if let Some(ext_str) = extension.to_str() {
-            return blacklist.contains(&ext_str.to_lowercase());
-        }
-    }
-    false
+    file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| blacklist.contains(ext))
 }
 
 fn setup_thread_pool(
     thread_count: Option<usize>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    match thread_count {
-        Some(count) => {
-            if count == 0 {
-                return Err("Thread count must be greater than 0".into());
-            }
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(count)
-                .build_global()
-                .map_err(|e| format!("Failed to configure thread pool: {}", e))?;
+) -> std::result::Result<(), Box<dyn error::Error>> {
+    if let Some(count) = thread_count {
+        if count == 0 {
+            return Err("Thread count must be greater than 0".into());
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(count)
+            .build_global()
+            .map_err(|e| format!("Failed to configure thread pool: {e}"))?;
 
-            LOGGER_INTERFACE.info(format!("Using {} threads", count).as_str());
-        }
-        None => {
-            let default_threads = rayon::current_num_threads();
-            LOGGER_INTERFACE.info(format!("Using {} threads", default_threads).as_str());
-        }
+        LOGGER_INTERFACE.info(format!("Using {count} threads").as_str());
+    } else {
+        let default_threads = rayon::current_num_threads();
+        LOGGER_INTERFACE.info(format!("Using {default_threads} threads").as_str());
     }
     Ok(())
 }
 
-fn collect_files(
-    max_depth: Option<usize>,
-) -> std::result::Result<Vec<walkdir::DirEntry>, Box<dyn std::error::Error>> {
-    let mut walker = WalkDir::new(".");
+fn collect_files(max_depth: Option<usize>) -> Vec<walkdir::DirEntry> {
+    let mut walker = WalkDir::new(".").follow_links(true);
 
     if let Some(depth) = max_depth {
         walker = walker.max_depth(depth);
-        match depth {
-            0 => LOGGER_INTERFACE.info("Collecting files from current directory only"),
-            1 => LOGGER_INTERFACE
-                .info("Collecting files from current directory and immediate subdirectories"),
-            _ => LOGGER_INTERFACE
-                .info(format!("Collecting files with maximum depth of {} levels", depth).as_str()),
-        }
-    } else {
-        LOGGER_INTERFACE.info("Collecting files from all subdirectories (unlimited depth)");
     }
 
-    let mut entries = Vec::new();
-    let mut directories_scanned = 0;
-
-    for entry in walker {
-        let item = match entry {
-            Ok(item) => item,
-            Err(e) => {
-                LOGGER_INTERFACE.error(format!("Failed to read directory entry: {}", e).as_str());
-                continue;
+    let (entries, dir_count) = walker.into_iter().filter_map(std::result::Result::ok).fold(
+        (Vec::new(), 0),
+        |(mut files, mut dirs), entry| {
+            if entry.file_type().is_dir() {
+                dirs += 1;
+            } else if entry.file_type().is_file() {
+                files.push(entry);
             }
-        };
-
-        if item.path().is_file() {
-            entries.push(item);
-        } else if item.path().is_dir() {
-            directories_scanned += 1;
-        }
-    }
+            (files, dirs)
+        },
+    );
 
     LOGGER_INTERFACE.info(
         format!(
             "Scanned {} directories, found {} files",
-            directories_scanned,
+            dir_count,
             entries.len()
         )
         .as_str(),
     );
-    Ok(entries)
+
+    entries
 }
 
 fn process_file(
     entry: &walkdir::DirEntry,
-    out_dir: &str,
+    out_dir: &Path,
     use_move: bool,
     blacklist: &HashSet<String>,
     categories: &HashMap<String, Vec<String>>,
     errors: &Arc<Mutex<Vec<String>>>,
-    skipped: &Arc<Mutex<u64>>,
+    skipped: &Arc<AtomicU64>,
 ) {
     if is_blacklisted(entry.path(), blacklist) {
-        if let Ok(mut skipped_count) = skipped.lock() {
-            *skipped_count += 1;
-        }
+        skipped.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
-    let result = || -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result = || -> std::result::Result<(), Box<dyn error::Error + Send + Sync>> {
         let file_name = entry
             .file_name()
             .to_str()
@@ -337,11 +355,11 @@ fn process_file(
 
         if use_move {
             move_file(
-                &source_path.to_string(),
-                &dest_path.to_str().unwrap().to_string(),
+                source_path.as_ref(),
+                dest_path.to_str().unwrap().to_string().as_ref(),
             )?;
         } else {
-            copy_file(&source_path, dest_path.to_str().unwrap(), false)?;
+            copy_file(&source_path, dest_path.to_str().unwrap())?;
         }
 
         Ok(())
@@ -355,6 +373,16 @@ fn process_file(
     }
 }
 
+fn get_blacklist(
+    args: &Cli,
+) -> std::result::Result<HashSet<String, RandomState>, Box<dyn error::Error>> {
+    load_blacklist(args)
+}
+
+fn get_categories(path: &Option<String>) -> std::result::Result<HashMap<String, Vec<String>>, Box<dyn Error>> {
+    load_categories(path.as_ref())
+}
+
 fn main() {
     let args = Cli::parse();
 
@@ -364,17 +392,11 @@ fn main() {
     }
 
     if let Err(e) = setup_thread_pool(args.threads) {
-        LOGGER_INTERFACE.error(format!("Error configuring threads: {}", e).as_str());
+        LOGGER_INTERFACE.error(format!("Error configuring threads: {e}").as_str());
         process::exit(1);
     }
 
-    let blacklist = match load_blacklist(&args) {
-        Ok(blacklist) => blacklist,
-        Err(e) => {
-            LOGGER_INTERFACE.error(format!("Error loading blacklist: {}", e).as_str());
-            process::exit(1);
-        }
-    };
+    let blacklist = get_blacklist(&args).expect("Failed to fetch blacklist");
 
     if !blacklist.is_empty() {
         LOGGER_INTERFACE.info(
@@ -382,7 +404,7 @@ fn main() {
                 "Blacklisted extensions: {}",
                 blacklist
                     .iter()
-                    .map(|s| format!(".{}", s))
+                    .map(|s| format!(".{s}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -390,27 +412,27 @@ fn main() {
         );
     }
 
-    let entries = match collect_files(args.max_depth) {
-        Ok(entries) => entries,
-        Err(e) => {
-            LOGGER_INTERFACE.error(format!("Error collecting files: {}", e).as_str());
-            process::exit(1);
-        }
-    };
+    let entries = collect_files(args.max_depth);
 
     if entries.is_empty() {
         LOGGER_INTERFACE.warning("No files found to process.");
         return;
     }
 
-    let progress = ProgressBar::new(entries.len() as u64);
-    let out_dir = args.output_dir.unwrap_or_else(|| "sorted".to_string());
+    let progress = Arc::new(Mutex::new(ProgressBar::new(entries.len() as u64)));
+    let out_dir = PathBuf::from(args.output_dir.unwrap_or_else(|| "sorted".to_string()));
     let errors = Arc::new(Mutex::new(Vec::new()));
-    let skipped = Arc::new(Mutex::new(0u64));
+    let skipped = Arc::new(AtomicU64::new(0));
 
     if let Err(e) = create_dir_all(&out_dir) {
-        LOGGER_INTERFACE
-            .error(format!("Failed to create output directory '{}': {}", out_dir, e).as_str());
+        LOGGER_INTERFACE.error(
+            format!(
+                "Failed to create output directory '{}': {}",
+                out_dir.to_str().unwrap(),
+                e
+            )
+            .as_str(),
+        );
         process::exit(1);
     }
 
@@ -420,65 +442,59 @@ fn main() {
             "Starting {} {} files to '{}'...",
             operation,
             entries.len(),
-            out_dir
+            out_dir.to_str().unwrap()
         )
         .as_str(),
     );
 
-    let category_map = match load_categories(&args.config) {
-        Ok(map) => map,
-        Err(e) => {
-            LOGGER_INTERFACE.error(format!("Error loading categories: {}", e).as_str());
-            process::exit(1);
-        }
-    };
+    let category_map =get_categories(&args.config).expect("Failed to fetch categories");
 
     if !category_map.is_empty() {
         LOGGER_INTERFACE.info("Loaded categories:");
         for (cat, exts) in &category_map {
-            LOGGER_INTERFACE.info(format!("  {}: {:?}", cat, exts).as_str());
+            LOGGER_INTERFACE.info(format!("  {cat}: {exts:?}").as_str());
         }
     }
 
     entries.par_iter().for_each(|entry| {
         process_file(
             entry,
-            &out_dir,
+            out_dir.as_ref(),
             args.mv,
             &blacklist,
             &category_map,
             &errors,
             &skipped,
         );
-        progress.inc(1);
+        progress.lock().unwrap().inc(1);
     });
 
-    progress.finish();
+    progress.lock().unwrap().finish();
 
-    let skipped_count = match skipped.lock() {
-        Ok(count) => *count,
-        Err(_) => {
-            LOGGER_INTERFACE.warning("Failed to get skipped file count");
-            0
+    if args.gen_html {
+        if let Err(e) = gen_html_index(&out_dir) {
+            LOGGER_INTERFACE.error(format!("Failed to generate html index: {e}").as_str());
         }
-    };
+    }
+
+    let skipped_count = skipped.load(Ordering::Relaxed);
     let processed_count = entries.len() as u64 - skipped_count;
 
     if let Ok(errors_vec) = errors.lock() {
         if !errors_vec.is_empty() {
-            LOGGER_INTERFACE.error("\nErrors encountered during processing:");
+            LOGGER_INTERFACE.error("Errors encountered during processing:");
             for error in errors_vec.iter() {
-                LOGGER_INTERFACE.error(format!("  {}", error).as_str());
+                LOGGER_INTERFACE.error(format!("  {error}").as_str());
             }
             LOGGER_INTERFACE
-                .info(format!("\nProcessing completed with {} errors.", errors_vec.len()).as_str());
+                .info(format!("Processing completed with {} errors.", errors_vec.len()).as_str());
         }
     }
 
-    LOGGER_INTERFACE.info("\nSummary:");
-    LOGGER_INTERFACE.info(format!("  Files processed: {}", processed_count).as_str());
+    LOGGER_INTERFACE.info("Summary:");
+    LOGGER_INTERFACE.info(format!("  Files processed: {processed_count}").as_str());
     if skipped_count > 0 {
-        LOGGER_INTERFACE.info(format!("  Files skipped (blacklisted): {}", skipped_count).as_str());
+        LOGGER_INTERFACE.info(format!("  Files skipped (blacklisted): {skipped_count}").as_str());
     }
 
     LOGGER_INTERFACE.info(format!("  Total files found: {}", entries.len()).as_str());
