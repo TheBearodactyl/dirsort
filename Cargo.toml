@@ -1,0 +1,11 @@
+[package]
+name = "dirsort"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.40", features = ["derive"] }
+indicatif = { version = "0.17.11", features = ["rayon"] }
+notify-rust = "4.11.7"
+rayon = "1.10.0"
+walkdir = "2.5.0"
