@@ -25,6 +25,7 @@ This document contains the help content for the `dirsort` command-line program.
 - `-d`, `--max-depth <MAX_DEPTH>` — Maximum depth to recurse into directories (0 = current directory only, default: unlimited)
 - `-c`, `--config <CONFIG>` — Path to a configuration file with desired categories ([**default**](#default-configuration))
 - `-i`, `--index` — Generate an HTML index file after sorting
+- `-s`, `--serve` — Serve the resulting sorted directory as a local server
 
 <hr/>
 
@@ -45,4 +46,3 @@ Archives = ["zip", "tar", "gz", "rar", "bz"]
     This document was generated automatically by
     <a href="https://crates.io/crates/clap-markdown"><code>clap-markdown</code></a>.
 </i></small>
-
