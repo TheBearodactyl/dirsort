@@ -1,7 +1,6 @@
-#![warn(clippy::pedantic, clippy::nursery)]
-#![allow(clippy::struct_excessive_bools)]
-
 use {
+    actix_files::Files,
+    actix_web::{App, HttpServer},
     clap::Parser,
     clap_markdown::help_markdown,
     indicatif::ProgressBar,
@@ -11,12 +10,12 @@ use {
     serde::{Deserialize, Serialize},
     std::{
         collections::{HashMap, HashSet},
+        error::{self, Error},
         fs::{self, File, create_dir_all, remove_file, rename},
+        hash::RandomState,
         io::{Result, Write},
         path::{Path, PathBuf},
         process,
-        error::{self, Error},
-        hash::RandomState,
         sync::{
             Arc, LazyLock, Mutex,
             atomic::{AtomicU64, Ordering},
@@ -73,6 +72,13 @@ struct Cli {
     /// Generate an HTML index file after sorting
     #[arg(short = 'i', long = "index")]
     gen_html: bool,
+
+    /// Serves the resulting sorted directory
+    #[arg(short, long)]
+    serve: bool,
+
+    #[arg(short, long)]
+    verbose: bool,
 
     #[arg(short, long, hide = true)]
     gen_docs: bool,
@@ -368,7 +374,9 @@ fn process_file(
     if let Err(e) = result() {
         let error_msg = format!("Failed to process '{}': {}", entry.path().display(), e);
         if let Ok(mut errors_vec) = errors.lock() {
-            errors_vec.push(error_msg);
+            if Cli::parse().verbose {
+                errors_vec.push(error_msg);
+            }
         }
     }
 }
@@ -379,11 +387,14 @@ fn get_blacklist(
     load_blacklist(args)
 }
 
-fn get_categories(path: &Option<String>) -> std::result::Result<HashMap<String, Vec<String>>, Box<dyn Error>> {
+fn get_categories(
+    path: &Option<String>,
+) -> std::result::Result<HashMap<String, Vec<String>>, Box<dyn Error>> {
     load_categories(path.as_ref())
 }
 
-fn main() {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let args = Cli::parse();
 
     if args.gen_docs {
@@ -416,7 +427,7 @@ fn main() {
 
     if entries.is_empty() {
         LOGGER_INTERFACE.warning("No files found to process.");
-        return;
+        return Ok(());
     }
 
     let progress = Arc::new(Mutex::new(ProgressBar::new(entries.len() as u64)));
@@ -447,7 +458,7 @@ fn main() {
         .as_str(),
     );
 
-    let category_map =get_categories(&args.config).expect("Failed to fetch categories");
+    let category_map = get_categories(&args.config).expect("Failed to fetch categories");
 
     if !category_map.is_empty() {
         LOGGER_INTERFACE.info("Loaded categories:");
@@ -472,7 +483,7 @@ fn main() {
     progress.lock().unwrap().finish();
 
     if args.gen_html {
-        if let Err(e) = gen_html_index(&out_dir) {
+        if let Err(e) = gen_html_index(out_dir.as_path()) {
             LOGGER_INTERFACE.error(format!("Failed to generate html index: {e}").as_str());
         }
     }
@@ -499,8 +510,24 @@ fn main() {
 
     LOGGER_INTERFACE.info(format!("  Total files found: {}", entries.len()).as_str());
 
+    if args.serve {
+        LOGGER_INTERFACE.info("Serving at 'http://127.0.0.1:6969'");
+        return HttpServer::new(|| {
+            App::new().service(
+                Files::new("/", Cli::parse().output_dir.unwrap_or("sorted".to_string()))
+                    .show_files_listing()
+                    .index_file("index.html"),
+            )
+        })
+        .bind("127.0.0.1:6969")?
+        .run()
+        .await;
+    }
+
     if args.notify {
         let operation = if args.mv { "moving" } else { "sorting" };
         send_finished_notif(operation);
     }
+
+    Ok(())
 }
